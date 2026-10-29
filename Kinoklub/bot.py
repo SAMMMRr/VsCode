@@ -8,8 +8,9 @@ import os
 import random
 import secrets
 import socket
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncGenerator, Awaitable, Callable
 from urllib.parse import quote
 
 import aiosqlite
@@ -28,6 +29,7 @@ from aiogram.types import (
     InlineQuery,
     InlineQueryResultArticle,
     InputMediaPhoto,
+    InputPollOptionUnion,
     InputRichBlockButtons,
     InputRichBlockParagraph,
     InputRichBlockPhoto,
@@ -63,7 +65,14 @@ POSTER_UPLOAD_INTERVAL_SECONDS = 1.1
 INLINE_SEARCH_TIMEOUT_SECONDS = 3
 INLINE_DETAILS_TIMEOUT_SECONDS = 1
 INLINE_PREPARATION_TIMEOUT_SECONDS = 6
+RICH_ACTION_TIMEOUT_SECONDS = 3
 POSTER_CACHE_BUILD = "2026-10-29-inline-v3"
+INLINE_CARD_RETENTION_DAYS = 30
+RICH_CARD_RETENTION_DAYS = 90
+CARD_CLEANUP_BATCH_SIZE = 500
+CARD_CLEANUP_INTERVAL_SECONDS = 60 * 60
+POLL_QUESTION = "Что смотрим?"
+POLL_MAX_OPTION_LENGTH = 100
 poster_last_upload_at = 0.0
 
 
@@ -127,9 +136,17 @@ class Movie:
 class Store:
     def __init__(self, path: str):
         self.path = path
+        self._card_cleanup_lock = asyncio.Lock()
+        self._last_card_cleanup_at = 0.0
+
+    @asynccontextmanager
+    async def connect(self) -> AsyncGenerator[aiosqlite.Connection, None]:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("PRAGMA foreign_keys=ON")
+            yield db
 
     async def init(self) -> None:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             await db.executescript(
                 """
                 PRAGMA journal_mode=WAL;
@@ -203,6 +220,10 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_favorites_chat_user ON favorites(chat_id, user_id);
                 CREATE INDEX IF NOT EXISTS idx_rich_cards_chat_message
                     ON rich_cards(chat_id, message_id);
+                CREATE INDEX IF NOT EXISTS idx_rich_cards_created_at
+                    ON rich_cards(created_at);
+                CREATE INDEX IF NOT EXISTS idx_inline_rich_cards_created_at
+                    ON inline_rich_cards(created_at);
                 """
             )
             await db.commit()
@@ -255,6 +276,76 @@ class Store:
                     raise
                 finally:
                     await db.execute("PRAGMA foreign_keys=ON")
+        await self.cleanup_expired_card_records()
+        self._last_card_cleanup_at = asyncio.get_running_loop().time()
+
+    async def cleanup_expired_card_records(
+        self, batch_size: int = CARD_CLEANUP_BATCH_SIZE
+    ) -> tuple[int, int, int]:
+        """Delete expired callback records in bounded batches (inline 30d, chat 90d)."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(
+                    """DELETE FROM inline_rich_card_instances
+                       WHERE rowid IN (
+                           SELECT i.rowid
+                           FROM inline_rich_card_instances AS i
+                           JOIN inline_rich_cards AS c ON c.token=i.token
+                           WHERE c.created_at < datetime('now', ?)
+                           LIMIT ?
+                       )""",
+                    (f"-{INLINE_CARD_RETENTION_DAYS} days", batch_size),
+                )
+                instances_deleted = max(cur.rowcount, 0)
+                cur = await db.execute(
+                    """DELETE FROM inline_rich_cards
+                       WHERE token IN (
+                           SELECT c.token
+                           FROM inline_rich_cards AS c
+                           WHERE c.created_at < datetime('now', ?)
+                             AND NOT EXISTS (
+                                 SELECT 1
+                                 FROM inline_rich_card_instances AS i
+                                 WHERE i.token=c.token
+                             )
+                           LIMIT ?
+                       )""",
+                    (f"-{INLINE_CARD_RETENTION_DAYS} days", batch_size),
+                )
+                inline_cards_deleted = max(cur.rowcount, 0)
+                cur = await db.execute(
+                    """DELETE FROM rich_cards
+                       WHERE rowid IN (
+                           SELECT rowid FROM rich_cards
+                           WHERE created_at < datetime('now', ?)
+                           LIMIT ?
+                       )""",
+                    (f"-{RICH_CARD_RETENTION_DAYS} days", batch_size),
+                )
+                rich_cards_deleted = max(cur.rowcount, 0)
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+        return instances_deleted, inline_cards_deleted, rich_cards_deleted
+
+    async def _cleanup_card_records_if_due(self) -> None:
+        loop = asyncio.get_running_loop()
+        if loop.time() - self._last_card_cleanup_at < CARD_CLEANUP_INTERVAL_SECONDS:
+            return
+        async with self._card_cleanup_lock:
+            if loop.time() - self._last_card_cleanup_at < CARD_CLEANUP_INTERVAL_SECONDS:
+                return
+            deleted = await self.cleanup_expired_card_records()
+            self._last_card_cleanup_at = loop.time()
+            if any(deleted):
+                log.info(
+                    "Expired card records cleaned (inline instances/cards, chat cards): %s",
+                    deleted,
+                )
 
     async def save_movie(self, movie: Movie) -> None:
         await self.save_movies([movie])
@@ -262,7 +353,7 @@ class Store:
     async def save_movies(self, movies: list[Movie]) -> None:
         if not movies:
             return
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             await db.executemany(
                 """INSERT INTO movies(
                        tmdb_id,title,year,overview,poster_path,tmdb_rating,
@@ -286,7 +377,7 @@ class Store:
             await db.commit()
 
     async def get_movie(self, tmdb_id: int) -> Movie | None:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM movies WHERE tmdb_id=?", (tmdb_id,))
             row = await cur.fetchone()
@@ -295,7 +386,7 @@ class Store:
     async def rate(
         self, chat_id: int | str, user_id: int, tmdb_id: int, value: float
     ) -> tuple[float, int, float | None]:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             cur = await db.execute(
                 "SELECT rating FROM ratings WHERE chat_id=? AND user_id=? AND tmdb_id=?",
                 (chat_id, user_id, tmdb_id),
@@ -316,7 +407,7 @@ class Store:
             return float(avg or 0), int(count or 0), float(previous[0]) if previous else None
 
     async def group_score(self, chat_id: int | str, tmdb_id: int) -> tuple[float, int]:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             cur = await db.execute(
                 "SELECT AVG(rating), COUNT(*) FROM ratings WHERE chat_id=? AND tmdb_id=?",
                 (chat_id, tmdb_id),
@@ -325,7 +416,7 @@ class Store:
             return float(avg or 0), int(count or 0)
 
     async def top(self, chat_id: int, limit: int = 10) -> list[tuple[Movie, float, int]]:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """SELECT m.*, AVG(r.rating) AS group_avg, COUNT(r.rating) AS votes
@@ -340,18 +431,16 @@ class Store:
     async def favorites(
         self, chat_id: int, user_id: int, limit: int = 10
     ) -> list[tuple[Movie, float | None]]:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                """SELECT DISTINCT m.*, r.rating AS my_rating
-                   FROM movies m
+                """SELECT m.*, r.rating AS my_rating
+                   FROM favorites f
+                   JOIN movies m ON m.tmdb_id=f.tmdb_id
                    LEFT JOIN ratings r
-                     ON r.tmdb_id=m.tmdb_id AND r.chat_id=? AND r.user_id=?
-                   LEFT JOIN favorites f
-                     ON f.tmdb_id=m.tmdb_id AND f.user_id=?
-                     AND f.chat_id IN (?, ?)
-                   WHERE (r.rating>=8 OR f.tmdb_id IS NOT NULL)
-                   ORDER BY COALESCE(r.rating, 0) DESC, m.title COLLATE NOCASE LIMIT ?""",
+                     ON r.tmdb_id=f.tmdb_id AND r.chat_id=? AND r.user_id=?
+                   WHERE f.user_id=? AND f.chat_id IN (?, ?)
+                   ORDER BY f.created_at DESC, m.title COLLATE NOCASE LIMIT ?""",
                 (chat_id, user_id, user_id, chat_id, f"inline-user:{user_id}", limit),
             )
             rows = await cur.fetchall()
@@ -363,31 +452,36 @@ class Store:
     async def toggle_favorite(
         self, chat_id: int | str, user_id: int, tmdb_id: int
     ) -> bool:
-        async with aiosqlite.connect(self.path) as db:
-            cur = await db.execute(
-                "SELECT 1 FROM favorites WHERE chat_id=? AND user_id=? AND tmdb_id=?",
-                (chat_id, user_id, tmdb_id),
-            )
-            exists = await cur.fetchone()
-            if exists:
-                await db.execute(
-                    "DELETE FROM favorites WHERE chat_id=? AND user_id=? AND tmdb_id=?",
+        async with self.connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cur = await db.execute(
+                    "SELECT 1 FROM favorites WHERE chat_id=? AND user_id=? AND tmdb_id=?",
                     (chat_id, user_id, tmdb_id),
                 )
-                is_favorite = False
-            else:
-                await db.execute(
-                    "INSERT INTO favorites(chat_id,user_id,tmdb_id) VALUES(?,?,?)",
-                    (chat_id, user_id, tmdb_id),
-                )
-                is_favorite = True
-            await db.commit()
-            return is_favorite
+                exists = await cur.fetchone()
+                if exists:
+                    await db.execute(
+                        "DELETE FROM favorites WHERE chat_id=? AND user_id=? AND tmdb_id=?",
+                        (chat_id, user_id, tmdb_id),
+                    )
+                    is_favorite = False
+                else:
+                    await db.execute(
+                        "INSERT INTO favorites(chat_id,user_id,tmdb_id) VALUES(?,?,?)",
+                        (chat_id, user_id, tmdb_id),
+                    )
+                    is_favorite = True
+                await db.commit()
+                return is_favorite
+            except BaseException:
+                await db.rollback()
+                raise
 
     async def is_favorite(
         self, chat_id: int | str, user_id: int, tmdb_id: int
     ) -> bool:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             cur = await db.execute(
                 "SELECT 1 FROM favorites WHERE chat_id=? AND user_id=? AND tmdb_id=?",
                 (chat_id, user_id, tmdb_id),
@@ -397,7 +491,7 @@ class Store:
     async def rating_distribution(
         self, chat_id: int | str, tmdb_id: int
     ) -> list[tuple[float, int]]:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             cur = await db.execute(
                 """SELECT rating, COUNT(*) FROM ratings
                    WHERE chat_id=? AND tmdb_id=? GROUP BY rating ORDER BY rating DESC""",
@@ -409,7 +503,7 @@ class Store:
     async def register_rich_card(
         self, token: str, chat_id: int, message_id: int, tmdb_id: int
     ) -> None:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             await db.execute(
                 "INSERT INTO rich_cards(token,chat_id,message_id,tmdb_id) VALUES(?,?,?,?)",
                 (token, chat_id, message_id, tmdb_id),
@@ -419,11 +513,12 @@ class Store:
     async def get_rich_card_movie_id(
         self, token: str, chat_id: int, message_id: int
     ) -> int | None:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             cur = await db.execute(
                 """SELECT tmdb_id FROM rich_cards
-                   WHERE token=? AND chat_id=? AND message_id=?""",
-                (token, chat_id, message_id),
+                   WHERE token=? AND chat_id=? AND message_id=?
+                     AND created_at >= datetime('now', ?)""",
+                (token, chat_id, message_id, f"-{RICH_CARD_RETENTION_DAYS} days"),
             )
             row = await cur.fetchone()
             return int(row[0]) if row else None
@@ -431,7 +526,7 @@ class Store:
     async def get_rich_card_token(
         self, chat_id: int, message_id: int, tmdb_id: int
     ) -> str:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             cur = await db.execute(
                 """SELECT token FROM rich_cards
                    WHERE chat_id=? AND message_id=? AND tmdb_id=?""",
@@ -450,7 +545,8 @@ class Store:
     ) -> None:
         if not cards:
             return
-        async with aiosqlite.connect(self.path) as db:
+        await self._cleanup_card_records_if_due()
+        async with self.connect() as db:
             await db.executemany(
                 "INSERT INTO inline_rich_cards(token,tmdb_id) VALUES(?,?)",
                 cards,
@@ -460,11 +556,12 @@ class Store:
     async def bind_inline_rich_card(
         self, token: str, inline_message_id: str, chat_instance: str
     ) -> int | None:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             cur = await db.execute(
-                "SELECT tmdb_id FROM inline_rich_cards WHERE token=?",
-                (token,),
+                """SELECT tmdb_id FROM inline_rich_cards
+                   WHERE token=? AND created_at >= datetime('now', ?)""",
+                (token, f"-{INLINE_CARD_RETENTION_DAYS} days"),
             )
             row = await cur.fetchone()
             if row is None:
@@ -480,7 +577,7 @@ class Store:
             return int(row[0])
 
     async def get_poster_file_id(self, poster_path: str) -> str | None:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             cur = await db.execute(
                 "SELECT file_id FROM poster_file_cache WHERE poster_path=?",
                 (poster_path,),
@@ -495,7 +592,7 @@ class Store:
         if not unique_paths:
             return {}
         placeholders = ",".join("?" for _ in unique_paths)
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             cur = await db.execute(
                 f"SELECT poster_path,file_id FROM poster_file_cache "
                 f"WHERE poster_path IN ({placeholders})",
@@ -507,7 +604,7 @@ class Store:
             }
 
     async def save_poster_file_id(self, poster_path: str, file_id: str) -> None:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             await db.execute(
                 """INSERT INTO poster_file_cache(poster_path,file_id) VALUES(?,?)
                    ON CONFLICT(poster_path) DO UPDATE SET
@@ -517,7 +614,7 @@ class Store:
             await db.commit()
 
     async def add_review(self, chat_id: int, user_id: int, username: str, tmdb_id: int, review: str) -> None:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             await db.execute(
                 "INSERT INTO reviews(chat_id,user_id,username,tmdb_id,review) VALUES(?,?,?,?,?)",
                 (chat_id, user_id, username, tmdb_id, review),
@@ -525,7 +622,7 @@ class Store:
             await db.commit()
 
     async def latest_review(self, chat_id: int, tmdb_id: int) -> tuple[str, str] | None:
-        async with aiosqlite.connect(self.path) as db:
+        async with self.connect() as db:
             cur = await db.execute(
                 "SELECT username, review FROM reviews WHERE chat_id=? AND tmdb_id=? ORDER BY id DESC LIMIT 1",
                 (chat_id, tmdb_id),
@@ -988,10 +1085,8 @@ async def telegram_poster_file_ids(
     if not missing:
         return cached
     if BOT_MEDIA_CACHE_CHAT_ID is None:
-        raise RuntimeError(
-            "Set BOT_MEDIA_CACHE_CHAT_ID to a private Telegram channel "
-            "where the bot can post poster files."
-        )
+        return cached
+    cache_chat_id = BOT_MEDIA_CACHE_CHAT_ID
 
     async with poster_cache_lock:
         cached.update(await store.get_poster_file_ids(list(posters)))
@@ -1058,13 +1153,13 @@ async def telegram_poster_file_ids(
                         )
                         uploaded_messages = [
                             await bot.send_photo(
-                                chat_id=BOT_MEDIA_CACHE_CHAT_ID,
+                                chat_id=cache_chat_id,
                                 photo=photo,
                             )
                         ]
                     else:
                         uploaded_messages = await bot.send_media_group(
-                            chat_id=BOT_MEDIA_CACHE_CHAT_ID,
+                            chat_id=cache_chat_id,
                             media=[
                                 InputMediaPhoto(
                                     media=(
@@ -1240,6 +1335,8 @@ async def warm_poster_cache(
     bot: Bot, movies: list[Movie], retry_after: int
 ) -> None:
     try:
+        if BOT_MEDIA_CACHE_CHAT_ID is None:
+            return
         await asyncio.sleep(retry_after)
         pending = movies
         retry_delays = (5, 20, 60)
@@ -1273,6 +1370,7 @@ async def warm_poster_cache(
                 )
             except (
                 aiohttp.ClientError,
+                aiosqlite.Error,
                 asyncio.TimeoutError,
                 RuntimeError,
                 TelegramAPIError,
@@ -1300,6 +1398,8 @@ async def warm_poster_cache(
 def schedule_poster_cache(
     bot: Bot, movies: list[Movie], retry_after: int
 ) -> asyncio.Task[None] | None:
+    if BOT_MEDIA_CACHE_CHAT_ID is None:
+        return None
     pending = [
         movie for movie in movies
         if movie.poster_path and movie.poster_path not in poster_cache_tasks
@@ -1314,10 +1414,22 @@ def schedule_poster_cache(
             None,
         )
     task = asyncio.create_task(warm_poster_cache(bot, pending, retry_after))
+    task.add_done_callback(_log_poster_cache_task_failure)
     for movie in pending:
         assert movie.poster_path is not None
         poster_cache_tasks[movie.poster_path] = task
     return task
+
+
+def _log_poster_cache_task_failure(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        log.error(
+            "Poster cache background task failed (%s).",
+            type(error).__name__,
+        )
 
 
 @router.inline_query()
@@ -1333,11 +1445,18 @@ async def inline_movie_search(query: InlineQuery) -> None:
             prepare_inline_movie_results(query, text_query),
             timeout=INLINE_PREPARATION_TIMEOUT_SECONDS,
         )
-    except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
+    except (
+        aiohttp.ClientError,
+        aiosqlite.Error,
+        asyncio.TimeoutError,
+        RuntimeError,
+        ValueError,
+        KeyError,
+        TypeError,
+    ) as exc:
         log.error(
-            "Inline movie card preparation failed (%s): %s",
+            "Inline movie card preparation failed (%s).",
             type(exc).__name__,
-            exc or "no exception message",
         )
         results = []
 
@@ -1374,8 +1493,12 @@ async def prepare_inline_movie_results(
         movie for movie in movies
         if movie.poster_path and movie.poster_path not in poster_file_ids
     ]
-    cache_task = schedule_poster_cache(query.bot, uncached_movies, 0)
-    if cache_task is not None:
+    cache_task = (
+        schedule_poster_cache(query.bot, uncached_movies, 0)
+        if query.bot is not None
+        else None
+    )
+    if cache_task is not None and BOT_MEDIA_CACHE_CHAT_ID is not None:
         poster_file_ids = await store.get_poster_file_ids(poster_paths)
 
     results: list[InlineQueryResultArticle] = []
@@ -1425,7 +1548,11 @@ async def answer_inline_query_safely(
         if "query is too old" in error or "query id is invalid" in error:
             log.warning("Telegram inline query expired before it could be answered.")
             return False
-        raise
+        log.error("Telegram rejected inline query response (%s).", type(exc).__name__)
+        return False
+    except TelegramAPIError as exc:
+        log.error("Telegram API failed to answer inline query (%s).", type(exc).__name__)
+        return False
     return True
 
 
@@ -1465,26 +1592,30 @@ async def update_rich_movie_card(
     poster_file_id = None
     if callback.inline_message_id and movie.poster_path:
         poster_file_id = await store.get_poster_file_id(movie.poster_path)
-        if poster_file_id is None:
-            poster_file_id = await telegram_poster_file_id(callback.bot, movie)
     rich_message = rich_movie_message(
         movie,
         avg,
         votes,
         card_token=card_token,
         poster_file_id=poster_file_id,
+        include_poster=(
+            not callback.inline_message_id or poster_file_id is not None
+        ),
         rating_prompt=rating_prompt,
         trailer_url=trailer_url,
         friend_ratings=friend_ratings,
         similar_movies=similar_movies,
     )
+    bot_client = callback.bot
+    if bot_client is None:
+        raise RuntimeError("Rich movie card callback has no bot client")
     if callback.inline_message_id:
-        await callback.bot.edit_message_text(
+        await bot_client.edit_message_text(
             inline_message_id=callback.inline_message_id,
             rich_message=rich_message,
         )
     elif callback.message:
-        await callback.bot.edit_message_text(
+        await bot_client.edit_message_text(
             chat_id=callback.message.chat.id,
             message_id=callback.message.message_id,
             rich_message=rich_message,
@@ -1501,8 +1632,8 @@ async def rich_movie_action(callback: CallbackQuery) -> None:
         nonlocal callback_answered
         if callback_answered:
             return
-        await callback.answer(text, show_alert=show_alert)
         callback_answered = True
+        await callback.answer(text, show_alert=show_alert)
 
     message = callback.message
     is_inline = callback.inline_message_id is not None
@@ -1543,41 +1674,42 @@ async def rich_movie_action(callback: CallbackQuery) -> None:
         await answer_once("Некорректная кнопка.", show_alert=True)
         return
 
-    if is_inline:
-        inline_message_id = callback.inline_message_id
-        chat_instance = callback.chat_instance
-        assert inline_message_id is not None and chat_instance is not None
-        tmdb_id = await store.bind_inline_rich_card(
-            card_token,
-            inline_message_id,
-            chat_instance,
-        )
-        rating_scope: int | str = f"inline:{chat_instance}"
-        favorite_scope: int | str = f"inline-user:{callback.from_user.id}"
-    else:
-        assert message is not None
-        tmdb_id = await store.get_rich_card_movie_id(
-            card_token, message.chat.id, message.message_id
-        )
-        rating_scope = message.chat.id
-        favorite_scope = message.chat.id
-    if tmdb_id is None:
-        await answer_once(
-            "Карточка устарела. Найдите фильм командой /film.",
-            show_alert=True,
-        )
+    try:
+        if is_inline:
+            inline_message_id = callback.inline_message_id
+            chat_instance = callback.chat_instance
+            assert inline_message_id is not None and chat_instance is not None
+            tmdb_id = await store.bind_inline_rich_card(
+                card_token,
+                inline_message_id,
+                chat_instance,
+            )
+            rating_scope: int | str = f"inline:{chat_instance}"
+            favorite_scope: int | str = f"inline-user:{callback.from_user.id}"
+        else:
+            assert message is not None
+            tmdb_id = await store.get_rich_card_movie_id(
+                card_token, message.chat.id, message.message_id
+            )
+            rating_scope = message.chat.id
+            favorite_scope = message.chat.id
+        if tmdb_id is None:
+            await answer_once(
+                "Карточка устарела. Найдите фильм командой /film.",
+                show_alert=True,
+            )
+            return
+        movie = await store.get_movie(tmdb_id)
+        if movie is None:
+            await answer_once(
+                "Фильм больше не найден в базе. Найдите его командой /film.",
+                show_alert=True,
+            )
+            return
+    except aiosqlite.Error as exc:
+        log.error("SQLite failed to resolve rich callback (%s).", type(exc).__name__)
+        await answer_once("Не удалось загрузить карточку. Попробуйте позже.", show_alert=True)
         return
-    movie = await store.get_movie(tmdb_id)
-    if movie is None:
-        await answer_once(
-            "Фильм больше не найден в базе. Найдите его командой /film.",
-            show_alert=True,
-        )
-        return
-
-    if is_inline and movie.poster_path:
-        if await store.get_poster_file_id(movie.poster_path) is None:
-            await answer_once("Загружаю постер и обновляю карточку…")
 
     try:
         if action == "rate":
@@ -1602,14 +1734,14 @@ async def rich_movie_action(callback: CallbackQuery) -> None:
             is_favorite = await store.toggle_favorite(
                 favorite_scope, callback.from_user.id, tmdb_id
             )
-            await update_rich_movie_card(
-                callback, movie, card_token=card_token, rating_scope=rating_scope
-            )
             await answer_once(
                 "Добавлено в избранное." if is_favorite else "Убрано из избранного."
             )
         elif action == "trailer":
-            trailer_url = await tmdb.trailer(movie)
+            trailer_url = await asyncio.wait_for(
+                tmdb.trailer(movie),
+                timeout=RICH_ACTION_TIMEOUT_SECONDS,
+            )
             if trailer_url is None:
                 await answer_once(
                     "Для этого фильма трейлер не найден.",
@@ -1635,7 +1767,10 @@ async def rich_movie_action(callback: CallbackQuery) -> None:
             )
             await answer_once("Показал оценки участников беседы.")
         elif action == "similar":
-            similar_movies = await tmdb.similar(movie)
+            similar_movies = await asyncio.wait_for(
+                tmdb.similar(movie),
+                timeout=RICH_ACTION_TIMEOUT_SECONDS,
+            )
             await update_rich_movie_card(
                 callback,
                 movie,
@@ -1650,37 +1785,65 @@ async def rich_movie_action(callback: CallbackQuery) -> None:
             )
             await answer_once("Вернул карточку фильма.")
     except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
-        log.warning("TMDB rich card action failed: %s", exc)
+        log.warning(
+            "Rich card TMDB action %s failed for movie %s (%s).",
+            action,
+            tmdb_id,
+            type(exc).__name__,
+        )
         await answer_once(
             "Не удалось получить данные TMDB. Попробуйте позже.",
             show_alert=True,
         )
     except TelegramBadRequest as exc:
-        log.warning("Telegram could not update a rich movie card: %s", exc)
-        if action == "ratevote":
-            error_message = "Оценка сохранена, но Telegram не смог обновить inline-карточку."
-        elif action == "favorite":
-            error_message = "Избранное изменено, но Telegram не смог обновить inline-карточку."
-        else:
-            error_message = "Telegram не смог обновить карточку. Попробуйте ещё раз."
+        if "message is not modified" in str(exc).casefold():
+            log.debug("Rich card action %s already has the desired content.", action)
+            confirmation = (
+                f"Оценка {value}/10 сохранена."
+                if action == "ratevote" and value is not None
+                else "Карточка уже показывает эти данные."
+            )
+            await answer_once(confirmation)
+            return
+        log.warning(
+            "Telegram rejected rich card action %s for movie %s (%s).",
+            action,
+            tmdb_id,
+            type(exc).__name__,
+        )
+        error_message = (
+            "Оценка сохранена, но Telegram не смог обновить карточку."
+            if action == "ratevote"
+            else "Telegram не смог обновить карточку. Попробуйте ещё раз."
+        )
         await answer_once(
             error_message,
             show_alert=True,
         )
     except TelegramAPIError as exc:
-        log.error("Telegram API failed while handling a rich movie card: %s", exc)
+        log.error(
+            "Telegram API failed during rich card action %s for movie %s (%s).",
+            action,
+            tmdb_id,
+            type(exc).__name__,
+        )
         await answer_once(
             "Telegram не выполнил действие. Попробуйте ещё раз.",
             show_alert=True,
         )
     except aiosqlite.Error as exc:
-        log.error("SQLite failed while handling a rich movie card: %s", exc)
+        log.error(
+            "SQLite failed during rich card action %s for movie %s (%s).",
+            action,
+            tmdb_id,
+            type(exc).__name__,
+        )
         await answer_once(
             "Не удалось сохранить данные. Попробуйте позже.",
             show_alert=True,
         )
     except LookupError as exc:
-        log.error("Rich movie card registry is inconsistent: %s", exc)
+        log.error("Rich card registry lookup failed (%s).", type(exc).__name__)
         await answer_once(
             "Карточка устарела. Отправьте её заново командой /film.",
             show_alert=True,
@@ -1695,11 +1858,13 @@ async def start(message: Message) -> None:
         "/film Семь — найти фильм или сериал\n"
         "/random — случайный популярный фильм\n"
         "/top — рейтинг вашей компании\n"
-        "/favorites — ваши оценки 8–10 в этой группе\n"
+        "/favorites — фильмы, которые вы добавили сердечком\n"
         "/vote Интерстеллар | Семь | Начало — голосование\n"
         "/review Название фильма | текст рецензии\n"
+        "/about — источник данных и атрибуция TMDB\n"
         "/help — все команды\n\n"
-        "Оценки хранятся отдельно для каждой группы.\n\n"
+        "Оценки и избранное хранятся отдельно для каждой группы. "
+        "Высокая оценка не добавляет фильм в избранное.\n\n"
         "🔎 Быстрый поиск: в любом чате введи @blastmovie_bot и название фильма, затем выбери результат.",
         parse_mode=ParseMode.HTML,
     )
@@ -1712,15 +1877,28 @@ async def help_command(message: Message) -> None:
         "🔎 <code>/film Семь</code> — карточка фильма/сериала с постером и оценками.\n"
         "🎲 <code>/random</code> — случайный популярный фильм.\n"
         "🏆 <code>/top</code> — топ по оценкам участников этой группы.\n"
-        "❤️ <code>/favorites</code> — ваши фильмы с оценкой 8–10 в текущей группе.\n"
+        "❤️ <code>/favorites</code> — фильмы, добавленные сердечком в этой группе; "
+        "высокие оценки отдельно и не добавляют фильм в избранное.\n"
         "🗳 <code>/vote Название 1 | Название 2 | Название 3</code> — голосование Telegram.\n"
         "📝 <code>/review Название | Текст отзыва</code> — сохранить и опубликовать рецензию.\n\n"
+        "ℹ️ <code>/about</code> — источник данных и атрибуция TMDB.\n\n"
         "Карточки /film, /random и результаты inline-поиска содержат встроенные кнопки: "
         "оценить, добавить в избранное, открыть трейлер, посмотреть оценки беседы и похожие фильмы.\n\n"
         "Также можно искать прямо в любом чате: напиши @blastmovie_bot и название фильма. "
         "Выбери результат, чтобы отправить карточку в беседу.\n\n"
         "Поиск в строке Telegram: введи @blastmovie_bot и название фильма, не отправляя запрос отдельным сообщением.\n\n"
-        "Любой участник может менять свою оценку повторным нажатием."
+        "Любой участник может менять свою оценку повторным нажатием. "
+        "Оценки и избранное в группах не смешиваются между чатами."
+    )
+
+
+@router.message(Command("about"))
+async def about_command(message: Message) -> None:
+    await message.answer(
+        "🎬 TMDB — источник данных и изображений о фильмах и сериалах.\n"
+        '<a href="https://www.themoviedb.org/assets/v4/logos/v2/blue_long_2-9665a76b1ae401a510ec1e0ca40ddcb3b0cfe45f1d51b77a308fea0845885648.svg">'
+        "Официальный логотип TMDB (SVG)</a>\n\n"
+        "This product uses the TMDB API but is not endorsed or certified by TMDB."
     )
 
 
@@ -1871,14 +2049,16 @@ async def top_movies(message: Message) -> None:
 
 @router.message(Command("favorites"))
 async def favorites(message: Message) -> None:
+    if message.from_user is None:
+        await message.answer("Избранное доступно только пользователям.")
+        return
     rows = await store.favorites(message.chat.id, message.from_user.id)
     if not rows:
         await message.answer(
-            "В избранном пока пусто. Добавьте фильм кнопкой «❤️ В избранное» "
-            "или поставьте ему оценку от 8/10."
+            "В избранном пока пусто. Добавьте фильм кнопкой «❤️ В избранное»."
         )
         return
-    lines = ["❤️ <b>Ваши любимые в этой группе</b>"]
+    lines = ["❤️ <b>Ваше избранное</b>"]
     for movie, rating in rows:
         rating_text = (
             f" — {rating:g}/10 {star_display(rating / 2)}"
@@ -1895,14 +2075,51 @@ async def favorites(message: Message) -> None:
 @router.message(Command("vote"))
 async def vote(message: Message, command: CommandObject) -> None:
     raw = (command.args or "").strip()
-    options = [x.strip() for x in raw.split("|") if x.strip()]
-    if not 2 <= len(options) <= 10:
-        await message.answer("Укажи от 2 до 10 вариантов через вертикальную черту:\n<code>/vote Интерстеллар | Семь | Начало</code>")
+    options = [option.strip() for option in raw.split("|")]
+    if (
+        not 2 <= len(options) <= 10
+        or any(not option for option in options)
+    ):
+        await message.answer(
+            "Укажи от 2 до 10 непустых вариантов через вертикальную черту:\n"
+            "<code>/vote Интерстеллар | Семь | Начало</code>"
+        )
         return
-    question = "Что смотрим?"
-    if len(question) > 300:
-        question = question[:300]
-    await message.answer_poll(question=question, options=options, is_anonymous=False, allows_multiple_answers=False)
+    duplicate_options = {
+        option.casefold()
+        for option in options
+        if sum(item.casefold() == option.casefold() for item in options) > 1
+    }
+    if duplicate_options:
+        await message.answer("Варианты голосования должны быть разными.")
+        return
+    too_long = [
+        option for option in options if len(option) > POLL_MAX_OPTION_LENGTH
+    ]
+    if too_long:
+        await message.answer(
+            f"Каждый вариант должен содержать не более "
+            f"{POLL_MAX_OPTION_LENGTH} символов."
+        )
+        return
+    if not 1 <= len(POLL_QUESTION) <= 300:
+        await message.answer("Вопрос голосования должен содержать от 1 до 300 символов.")
+        return
+    poll_options: list[InputPollOptionUnion] = []
+    poll_options.extend(options)
+    try:
+        await message.answer_poll(
+            question=POLL_QUESTION,
+            options=poll_options,
+            is_anonymous=False,
+            allows_multiple_answers=False,
+        )
+    except TelegramBadRequest as exc:
+        log.warning("Telegram rejected /vote poll (%s).", type(exc).__name__)
+        await message.answer("Telegram не смог создать голосование. Проверь варианты.")
+    except TelegramAPIError as exc:
+        log.error("Telegram API failed during /vote (%s).", type(exc).__name__)
+        await message.answer("Не удалось создать голосование в Telegram. Попробуй позже.")
 
 
 @router.message(Command("review"))
@@ -1949,11 +2166,17 @@ async def main() -> None:
         BotCommand(command="film", description="Найти фильм или сериал"),
         BotCommand(command="random", description="Случайный популярный фильм"),
         BotCommand(command="top", description="Топ вашей группы"),
-        BotCommand(command="favorites", description="Мои любимые в этой группе"),
+        BotCommand(command="favorites", description="Моё избранное"),
         BotCommand(command="vote", description="Голосование за вечерний просмотр"),
         BotCommand(command="review", description="Написать рецензию"),
+        BotCommand(command="about", description="Данные и атрибуция TMDB"),
         BotCommand(command="help", description="Список команд"),
     ])
+    if BOT_MEDIA_CACHE_CHAT_ID is None:
+        log.warning(
+            "BOT_MEDIA_CACHE_CHAT_ID is not set; poster file-ID caching is disabled. "
+            "Inline search will use TMDB thumbnails without embedded poster photos."
+        )
     try:
         log.info(
             "КиноКлуб запущен. Ожидаю сообщения Telegram… "

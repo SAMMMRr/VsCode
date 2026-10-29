@@ -63,6 +63,13 @@ class RichMessageTests(unittest.TestCase):
         self.assertTrue(
             all(button.callback_data.startswith("rich:") for block in button_blocks for button in block.buttons)
         )
+        self.assertTrue(
+            all(
+                len(button.callback_data.encode("utf-8")) <= 64
+                for block in button_blocks
+                for button in block.buttons
+            )
+        )
         self.assertIn("rich:rate:test_token", [
             button.callback_data
             for block in button_blocks
@@ -365,10 +372,30 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
                         PRIMARY KEY (chat_id, user_id, tmdb_id)
                     );
                     INSERT INTO ratings(chat_id,user_id,tmdb_id,rating) VALUES ('-100', 10, 42, 8);
+                    CREATE TABLE favorites (
+                        chat_id TEXT NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        tmdb_id INTEGER NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (chat_id, user_id, tmdb_id)
+                    );
+                    INSERT INTO favorites(chat_id,user_id,tmdb_id) VALUES ('-100', 10, 42);
+                    CREATE TABLE reviews (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        chat_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        username TEXT NOT NULL,
+                        tmdb_id INTEGER NOT NULL,
+                        review TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO reviews(chat_id,user_id,username,tmdb_id,review)
+                    VALUES (-100, 10, 'Reviewer', 42, 'Старая рецензия');
                     """
                 )
 
             store = bot.Store(path)
+            await store.init()
             await store.init()
             movie = await store.get_movie(42)
             self.assertIsNotNone(movie)
@@ -377,6 +404,14 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(movie.genres, ())
             self.assertIsNone(movie.runtime_minutes)
             self.assertEqual(await store.group_score(-100, 42), (8.0, 1))
+            self.assertEqual(
+                (await store.favorites(-100, 10))[0][0].tmdb_id,
+                42,
+            )
+            self.assertEqual(
+                await store.latest_review(-100, 42),
+                ("Reviewer", "Старая рецензия"),
+            )
 
             detailed = bot.Movie(
                 42,
@@ -396,20 +431,66 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(loaded.genres, ("Драма",))
             self.assertEqual(loaded.runtime_minutes, 47)
 
-    async def test_favorite_toggle_and_rating_based_favorites(self) -> None:
+    async def test_favorites_only_include_explicit_hearts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = bot.Store(str(Path(directory) / "store.sqlite3"))
             await store.init()
-            await store.save_movie(self_movie := bot.Movie(42, "Фильм", "2024", "", None, 0))
+            movies = [
+                bot.Movie(42, "Оценённый", "2024", "", None, 0),
+                bot.Movie(43, "Избранный", "2024", "", None, 0),
+            ]
+            await store.save_movies(movies)
+            await store.rate(-100, 5, 42, 8)
+            self.assertEqual(await store.favorites(-100, 5), [])
 
             self.assertTrue(await store.toggle_favorite(-100, 5, 42))
             self.assertTrue(await store.is_favorite(-100, 5, 42))
-            self.assertEqual((await store.favorites(-100, 5))[0][0], self_movie)
+            self.assertEqual((await store.favorites(-100, 5))[0][0], movies[0])
             self.assertFalse(await store.toggle_favorite(-100, 5, 42))
             self.assertFalse(await store.is_favorite(-100, 5, 42))
+            self.assertEqual(await store.favorites(-100, 5), [])
 
-            await store.rate(-100, 5, 42, 8)
+            self.assertTrue(await store.toggle_favorite(-100, 5, 43))
+            await store.rate(-100, 5, 43, 10)
+            self.assertEqual((await store.favorites(-100, 5))[0][0], movies[1])
+            self.assertFalse(await store.toggle_favorite(-100, 5, 43))
+            self.assertEqual(await store.favorites(-100, 5), [])
+
+    async def test_favorites_are_scoped_by_chat_and_user(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = bot.Store(str(Path(directory) / "favorite_scopes.sqlite3"))
+            await store.init()
+            await store.save_movie(bot.Movie(42, "Фильм", "2024", "", None, 0))
+            await store.toggle_favorite(-100, 5, 42)
+
             self.assertEqual(len(await store.favorites(-100, 5)), 1)
+            self.assertEqual(await store.favorites(-200, 5), [])
+            self.assertEqual(await store.favorites(-100, 6), [])
+
+    async def test_concurrent_favorite_toggles_are_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = bot.Store(str(Path(directory) / "concurrent_favorites.sqlite3"))
+            await store.init()
+            await store.save_movie(bot.Movie(42, "Фильм", "2024", "", None, 0))
+
+            results = await bot.asyncio.gather(
+                store.toggle_favorite(-100, 5, 42),
+                store.toggle_favorite(-100, 5, 42),
+            )
+
+            self.assertEqual(sorted(results), [False, True])
+            self.assertFalse(await store.is_favorite(-100, 5, 42))
+
+    async def test_store_connections_enable_foreign_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = bot.Store(str(Path(directory) / "foreign_keys.sqlite3"))
+            await store.init()
+
+            async with store.connect() as db:
+                cursor = await db.execute("PRAGMA foreign_keys")
+                self.assertEqual((await cursor.fetchone())[0], 1)
+                cursor = await db.execute("PRAGMA foreign_key_check")
+                self.assertEqual(await cursor.fetchall(), [])
 
     async def test_rich_card_token_is_bound_to_its_chat_and_message(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -499,6 +580,64 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
                 await store.bind_inline_rich_card(
                     "token_123456", "inline-message-2", "chat-instance-1"
                 ),
+                42,
+            )
+
+    async def test_expired_card_cleanup_removes_dependents_but_keeps_fresh_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = bot.Store(str(Path(directory) / "card_cleanup.sqlite3"))
+            await store.init()
+            await store.save_movie(bot.Movie(42, "Фильм", "2024", "", None, 0))
+            await store.register_inline_rich_cards([
+                ("oldtoken_123", 42),
+                ("newtoken_123", 42),
+            ])
+            await store.bind_inline_rich_card(
+                "oldtoken_123", "old-inline-message", "chat-old"
+            )
+            await store.bind_inline_rich_card(
+                "newtoken_123", "new-inline-message", "chat-new"
+            )
+            await store.register_rich_card("oldcard_123", -100, 10, 42)
+            await store.register_rich_card("newcard_123", -100, 11, 42)
+            async with store.connect() as db:
+                await db.execute(
+                    "UPDATE inline_rich_cards SET created_at=datetime('now','-31 days') "
+                    "WHERE token='oldtoken_123'"
+                )
+                await db.execute(
+                    "UPDATE rich_cards SET created_at=datetime('now','-91 days') "
+                    "WHERE token='oldcard_123'"
+                )
+                await db.commit()
+
+            self.assertIsNone(
+                await store.bind_inline_rich_card(
+                    "oldtoken_123", "expired-before-cleanup", "chat-old"
+                )
+            )
+            self.assertIsNone(
+                await store.get_rich_card_movie_id("oldcard_123", -100, 10)
+            )
+            deleted = await store.cleanup_expired_card_records()
+
+            self.assertEqual(deleted, (1, 1, 1))
+            self.assertIsNone(
+                await store.bind_inline_rich_card(
+                    "oldtoken_123", "stale-message", "chat-old"
+                )
+            )
+            self.assertEqual(
+                await store.bind_inline_rich_card(
+                    "newtoken_123", "fresh-message", "chat-new"
+                ),
+                42,
+            )
+            self.assertIsNone(
+                await store.get_rich_card_movie_id("oldcard_123", -100, 10)
+            )
+            self.assertEqual(
+                await store.get_rich_card_movie_id("newcard_123", -100, 11),
                 42,
             )
 
@@ -1034,6 +1173,14 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_poster_cache_is_not_scheduled_without_cache_channel(self) -> None:
+        movie = bot.Movie(42, "Фильм", "2024", "", "/poster.jpg", 0)
+        with patch.object(bot, "BOT_MEDIA_CACHE_CHAT_ID", None):
+            task = bot.schedule_poster_cache(SimpleNamespace(), [movie], 0)
+
+        self.assertIsNone(task)
+        self.assertNotIn(movie.poster_path, bot.poster_cache_tasks)
+
     async def test_rating_and_favorite_callbacks_use_current_user_and_chat(self) -> None:
         movie = bot.Movie(42, "Фильм", "2024", "Описание", None, 8.0)
         fake_store = SimpleNamespace(
@@ -1074,9 +1221,106 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
             await bot.rich_movie_action(callback)
 
         fake_store.toggle_favorite.assert_awaited_once_with(-100123, 55, 42)
+        callback.bot.edit_message_text.assert_not_awaited()
         callback.answer.assert_awaited_once_with(
             "Добавлено в избранное.", show_alert=False
         )
+
+        fake_store.toggle_favorite.side_effect = [False]
+        callback.data = "rich:favorite:card_token_123"
+        callback.answer.reset_mock()
+        with patch.object(bot, "store", fake_store):
+            await bot.rich_movie_action(callback)
+        callback.answer.assert_awaited_once_with(
+            "Убрано из избранного.", show_alert=False
+        )
+        callback.bot.edit_message_text.assert_not_awaited()
+
+    async def test_repeat_rating_is_success_when_card_is_not_modified(self) -> None:
+        movie = bot.Movie(42, "Фильм", "2024", "Описание", None, 8.0)
+        fake_store = SimpleNamespace(
+            get_movie=AsyncMock(return_value=movie),
+            rate=AsyncMock(return_value=(8.0, 2, 8.0)),
+            group_score=AsyncMock(return_value=(8.0, 2)),
+            get_rich_card_movie_id=AsyncMock(return_value=42),
+        )
+        callback = SimpleNamespace(
+            data="rich:ratevote:card_token_123:8",
+            message=SimpleNamespace(
+                chat=SimpleNamespace(id=-100123, type=ChatType.SUPERGROUP),
+                message_id=77,
+            ),
+            inline_message_id=None,
+            from_user=SimpleNamespace(id=55),
+            answer=AsyncMock(),
+            bot=SimpleNamespace(
+                edit_message_text=AsyncMock(
+                    side_effect=TelegramBadRequest(
+                        method=SendRichMessage(
+                            chat_id=-100123,
+                            rich_message=bot.InputRichMessage(blocks=[]),
+                        ),
+                        message="message is not modified",
+                    )
+                )
+            ),
+        )
+
+        with patch.object(bot, "store", fake_store):
+            await bot.rich_movie_action(callback)
+
+        fake_store.rate.assert_awaited_once_with(-100123, 55, 42, 8.0)
+        callback.answer.assert_awaited_once_with(
+            "Оценка 8/10 сохранена.", show_alert=False
+        )
+
+    async def test_repeated_trailer_friends_and_similar_are_not_modified_successes(self) -> None:
+        movie = bot.Movie(42, "Фильм", "2024", "Описание", None, 8.0)
+        fake_store = SimpleNamespace(
+            get_movie=AsyncMock(return_value=movie),
+            get_rich_card_movie_id=AsyncMock(return_value=42),
+            group_score=AsyncMock(return_value=(8.0, 1)),
+            rating_distribution=AsyncMock(return_value=[(8.0, 1)]),
+        )
+        not_modified = TelegramBadRequest(
+            method=SendRichMessage(
+                chat_id=-100123,
+                rich_message=bot.InputRichMessage(blocks=[]),
+            ),
+            message="message is not modified",
+        )
+        callback = SimpleNamespace(
+            data="",
+            message=SimpleNamespace(
+                chat=SimpleNamespace(id=-100123, type=ChatType.SUPERGROUP),
+                message_id=77,
+            ),
+            inline_message_id=None,
+            from_user=SimpleNamespace(id=55),
+            answer=AsyncMock(),
+            bot=SimpleNamespace(edit_message_text=AsyncMock(side_effect=not_modified)),
+        )
+
+        with (
+            patch.object(bot, "store", fake_store),
+            patch.object(
+                bot.tmdb,
+                "trailer",
+                new=AsyncMock(return_value="https://youtube.com/watch?v=trailer"),
+            ),
+            patch.object(bot.tmdb, "similar", new=AsyncMock(return_value=[])),
+        ):
+            for action in ("trailer", "friends", "similar"):
+                with self.subTest(action=action):
+                    callback.data = f"rich:{action}:card_token_123"
+                    callback.answer.reset_mock()
+                    await bot.rich_movie_action(callback)
+                    callback.answer.assert_awaited_once_with(
+                        "Карточка уже показывает эти данные.",
+                        show_alert=False,
+                    )
+
+        self.assertEqual(callback.bot.edit_message_text.await_count, 3)
 
     async def test_invalid_rich_callback_is_rejected(self) -> None:
         callback = SimpleNamespace(
@@ -1144,6 +1388,74 @@ class CallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(similar), 1)
         self.assertEqual(similar[0].tmdb_id, 99)
         self.assertEqual(similar[0].media_type, "movie")
+
+
+class CommandValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def invoke_vote(self, raw: str):
+        message = SimpleNamespace(
+            answer=AsyncMock(),
+            answer_poll=AsyncMock(),
+        )
+        await bot.vote(message, SimpleNamespace(args=raw))
+        return message
+
+    async def test_vote_accepts_minimum_and_maximum_options(self) -> None:
+        for count in (2, 10):
+            with self.subTest(count=count):
+                options = [f"Фильм {index}" for index in range(count)]
+                message = await self.invoke_vote(
+                    " | ".join(f" {option} " for option in options)
+                )
+                message.answer_poll.assert_awaited_once()
+                self.assertEqual(
+                    message.answer_poll.await_args.kwargs["options"],
+                    options,
+                )
+                self.assertEqual(
+                    message.answer_poll.await_args.kwargs["question"],
+                    bot.POLL_QUESTION,
+                )
+
+    async def test_vote_rejects_empty_and_out_of_range_option_counts(self) -> None:
+        for raw in ("", "Один вариант", "Первый || Третий", " | Первый", " | ".join(
+            f"Фильм {index}" for index in range(11)
+        )):
+            with self.subTest(raw=raw):
+                message = await self.invoke_vote(raw)
+                message.answer_poll.assert_not_awaited()
+                message.answer.assert_awaited_once()
+
+    async def test_vote_rejects_overlong_and_duplicate_options(self) -> None:
+        overlong = await self.invoke_vote(f"{'x' * 101} | Второй")
+        overlong.answer_poll.assert_not_awaited()
+        self.assertIn("100", overlong.answer.await_args.args[0])
+
+        duplicates = await self.invoke_vote("Семь |  семь ")
+        duplicates.answer_poll.assert_not_awaited()
+        self.assertIn("разными", duplicates.answer.await_args.args[0])
+
+    async def test_vote_rejects_overlong_question_before_sending(self) -> None:
+        with patch.object(bot, "POLL_QUESTION", "Вопрос" * 51):
+            message = await self.invoke_vote("Первый | Второй")
+
+        message.answer_poll.assert_not_awaited()
+        self.assertIn("300", message.answer.await_args.args[0])
+
+    async def test_about_contains_tmdb_attribution_and_official_logo(self) -> None:
+        message = SimpleNamespace(answer=AsyncMock())
+
+        await bot.about_command(message)
+
+        text = message.answer.await_args.args[0]
+        self.assertIn(
+            "This product uses the TMDB API but is not endorsed or certified by TMDB.",
+            text,
+        )
+        self.assertIn("источник данных и изображений", text)
+        self.assertIn(
+            "https://www.themoviedb.org/assets/v4/logos/v2/blue_long_2-",
+            text,
+        )
 
 
 if __name__ == "__main__":
