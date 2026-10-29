@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+*.sqlite3
+*.db
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/settings.json
+data/
